@@ -1,0 +1,90 @@
+services:
+  kafka:
+    image: bitnami/kafka:3.6
+    container_name: kafka
+    environment:
+      - KAFKA_ENABLE_KRAFT=yes
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@localhost:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - ALLOW_PLAINTEXT_LISTENER=yes
+    ports:
+      - "29092:29092"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc '</dev/tcp/127.0.0.1/9092'"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    restart: unless-stopped
+
+  topic-init:
+    image: bitnami/kafka:3.6
+    depends_on:
+      kafka:
+        condition: service_started
+    entrypoint: ["/bin/bash","-lc"]
+    command: |
+      /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+        --create --if-not-exists --topic sensors --partitions 1 --replication-factor 1 || true
+      /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+        --create --if-not-exists --topic predictions --partitions 1 --replication-factor 1 || true
+    restart: "no"
+
+
+  spark:
+    image: bitnami/spark:3.5
+    container_name: spark
+    user: root
+    depends_on:
+      kafka:
+        condition: service_started
+
+    working_dir: /app
+    environment:
+      - SPARK_DRIVER_MEMORY=2g
+      - PYSPARK_PYTHON=/opt/venv/bin/python
+      - PYSPARK_DRIVER_PYTHON=/opt/venv/bin/python
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - KAFKA_TOPIC=sensors
+      - PREDICTIONS_TOPIC=predictions
+      - MODEL_PATH=/app/models/pipeline.joblib
+      - SENSORS_PARQUET_PATH=/app/data/sensors_parquet
+      - SENSORS_CHECKPOINT=/app/checkpoints/sensors_parquet
+      - PREDICTIONS_PARQUET_PATH=/app/data/predictions_parquet
+      - INFER_CHECKPOINT=/app/checkpoints/infer_query
+      - KAFKA_START=latest
+    volumes:
+      - ../:/app
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends python3-venv python3-pip gcc g++ libgomp1
+        python3 -m venv /opt/venv
+        /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+        /opt/venv/bin/pip install --no-cache-dir \
+          numpy==2.3.3 pandas==2.3.2 scikit-learn==1.7.2 xgboost==3.0.5 \
+          joblib==1.4.2 pyarrow==17.0.0
+        /opt/bitnami/spark/bin/spark-submit --master local[*] \
+          --conf spark.sql.shuffle.partitions=8 \
+          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
+          /app/src/spark_stream.py
+    restart: unless-stopped
+
+volumes:
+  kafka_data:
